@@ -25,10 +25,10 @@
 {{- $affinity := or .Values.pgbouncer.affinity .Values.affinity }}
 {{- $tolerations := or .Values.pgbouncer.tolerations .Values.tolerations }}
 {{- $topologySpreadConstraints := or .Values.pgbouncer.topologySpreadConstraints .Values.topologySpreadConstraints }}
-{{- $revisionHistoryLimit := or .Values.pgbouncer.revisionHistoryLimit .Values.revisionHistoryLimit }}
-{{- $securityContext := include "localPodSecurityContext" .Values.pgbouncer }}
-{{- $containerSecurityContext := include "externalContainerSecurityContext" .Values.pgbouncer }}
-{{- $containerSecurityContextMetricsExporter := include "externalContainerSecurityContext" .Values.pgbouncer.metricsExporterSidecar }}
+{{- $revisionHistoryLimit := include "airflow.revisionHistoryLimit" (list .Values.pgbouncer.revisionHistoryLimit .Values.revisionHistoryLimit) }}
+{{- $securityContext := include "localPodSecurityContext" (list .Values.pgbouncer .Values) }}
+{{- $containerSecurityContext := include "externalContainerSecurityContext" (list .Values.pgbouncer .Values) }}
+{{- $containerSecurityContextMetricsExporter := include "externalContainerSecurityContext" (list .Values.pgbouncer.metricsExporterSidecar .Values) }}
 {{- $containerLifecycleHooks := .Values.pgbouncer.containerLifecycleHooks }}
 {{- $containerLifecycleHooksMetricsExporter := .Values.pgbouncer.metricsExporterSidecar.containerLifecycleHooks }}
 apiVersion: apps/v1
@@ -49,7 +49,7 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.pgbouncer.replicas | default "1" }}
-  {{- if $revisionHistoryLimit }}
+  {{- if ne $revisionHistoryLimit "" }}
   revisionHistoryLimit: {{ $revisionHistoryLimit }}
   {{- end }}
   strategy:
@@ -67,14 +67,14 @@ spec:
         tier: airflow
         component: pgbouncer
         release: {{ .Release.Name }}
-        {{- with .Values.labels }}
-          {{- toYaml . | nindent 8 }}
+        {{- if or .Values.labels .Values.pgbouncer.labels }}
+          {{- mustMerge .Values.pgbouncer.labels .Values.labels | toYaml | nindent 8 }}
         {{- end }}
       annotations:
         checksum/pgbouncer-config-secret: {{ include (print $.Template.BasePath "/secrets/pgbouncer-config-secret.yaml") . | sha256sum }}
         checksum/pgbouncer-certificates-secret: {{ include (print $.Template.BasePath "/secrets/pgbouncer-certificates-secret.yaml") . | sha256sum }}
         {{- if .Values.pgbouncer.podAnnotations }}
-          {{- toYaml .Values.pgbouncer.podAnnotations | nindent 8 }}
+          {{- tpl (toYaml .Values.pgbouncer.podAnnotations) . | nindent 8 }}
         {{- end }}
     spec:
       {{- if .Values.pgbouncer.priorityClassName }}
@@ -87,18 +87,21 @@ spec:
       {{- end }}
       tolerations: {{- toYaml $tolerations | nindent 8 }}
       topologySpreadConstraints: {{- toYaml $topologySpreadConstraints | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.pgbouncer.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "pgbouncer.serviceAccountName" . }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
+      {{- if $securityContext }}
       securityContext: {{ $securityContext | nindent 8 }}
-      restartPolicy: Always
-      {{- if or .Values.registry.secretName .Values.registry.connection }}
-      imagePullSecrets:
-        - name: {{ template "registry_secret" . }}
       {{- end }}
+      restartPolicy: Always
+      imagePullSecrets: {{- include "image_pull_secrets" . | nindent 8 }}
       containers:
         - name: pgbouncer
           image: {{ template "pgbouncer_image" . }}
           imagePullPolicy: {{ .Values.images.pgbouncer.pullPolicy }}
+          {{- if $containerSecurityContext }}
           securityContext: {{ $containerSecurityContext | nindent 12 }}
+          {{- end }}
           {{- if .Values.pgbouncer.command }}
           command: {{ tpl (toYaml .Values.pgbouncer.command) . | nindent 12 }}
           {{- end }}
@@ -118,7 +121,9 @@ spec:
           readinessProbe:
             tcpSocket:
               port: {{ .Values.ports.pgbouncer }}
+          {{- if or .Values.pgbouncer.mountConfigSecret .Values.pgbouncer.ssl.ca .Values.pgbouncer.ssl.cert .Values.pgbouncer.ssl.key .Values.volumeMounts .Values.pgbouncer.extraVolumeMounts }}
           volumeMounts:
+            {{- if .Values.pgbouncer.mountConfigSecret }}
             - name: pgbouncer-config
               subPath: pgbouncer.ini
               mountPath: /etc/pgbouncer/pgbouncer.ini
@@ -127,6 +132,7 @@ spec:
               subPath: users.txt
               mountPath: /etc/pgbouncer/users.txt
               readOnly: true
+            {{- end}}
             {{- if .Values.pgbouncer.ssl.ca }}
             - name: pgbouncer-certificates
               subPath: root.crt
@@ -146,11 +152,12 @@ spec:
               readOnly: true
             {{- end }}
             {{- if .Values.volumeMounts }}
-              {{- toYaml .Values.volumeMounts | nindent 12 }}
+              {{- tpl (toYaml .Values.volumeMounts) . | nindent 12 }}
             {{- end }}
             {{- if .Values.pgbouncer.extraVolumeMounts }}
               {{- tpl (toYaml .Values.pgbouncer.extraVolumeMounts) . | nindent 12 }}
             {{- end }}
+          {{- end}}
           {{- if $containerLifecycleHooks }}
           lifecycle: {{- tpl (toYaml $containerLifecycleHooks) . | nindent 12 }}
           {{- end }}
@@ -158,13 +165,15 @@ spec:
           resources: {{- toYaml .Values.pgbouncer.metricsExporterSidecar.resources | nindent 12 }}
           image: {{ template "pgbouncer_exporter_image" . }}
           imagePullPolicy: {{ .Values.images.pgbouncerExporter.pullPolicy }}
+          {{- if $containerSecurityContextMetricsExporter }}
           securityContext: {{ $containerSecurityContextMetricsExporter | nindent 12 }}
+          {{- end }}
           env:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ template "pgbouncer_stats_secret" . }}
-                  {{- if (and .Values.pgbouncer.metricsExporterSidecar.statsSecretName .Values.pgbouncer.metricsExporterSidecar.statsSecretKey) }}
+                  {{- if and .Values.pgbouncer.metricsExporterSidecar.statsSecretName .Values.pgbouncer.metricsExporterSidecar.statsSecretKey }}
                   key: {{ .Values.pgbouncer.metricsExporterSidecar.statsSecretKey }}
                   {{- else }}
                   key: "connection"
@@ -191,22 +200,30 @@ spec:
           {{- if $containerLifecycleHooksMetricsExporter }}
           lifecycle: {{- tpl (toYaml $containerLifecycleHooksMetricsExporter) . | nindent 12 }}
           {{- end }}
+          {{- if .Values.pgbouncer.metricsExporterSidecar.extraVolumeMounts }}
+          volumeMounts:
+            {{- tpl (toYaml .Values.pgbouncer.metricsExporterSidecar.extraVolumeMounts) . | nindent 12 }}
+          {{- end}}
         {{- if .Values.pgbouncer.extraContainers }}
-          {{- toYaml .Values.pgbouncer.extraContainers | nindent 8 }}
+          {{- tpl (toYaml .Values.pgbouncer.extraContainers) . | nindent 8 }}
         {{- end }}
+      {{- if or .Values.pgbouncer.mountConfigSecret .Values.pgbouncer.ssl.ca .Values.pgbouncer.ssl.cert .Values.pgbouncer.ssl.key .Values.volumes .Values.pgbouncer.extraVolumes }}
       volumes:
+        {{- if .Values.pgbouncer.mountConfigSecret }}
         - name: pgbouncer-config
           secret:
             secretName: {{ template "pgbouncer_config_secret" . }}
-        {{- if or .Values.pgbouncer.ssl.ca  .Values.pgbouncer.ssl.cert .Values.pgbouncer.ssl.key }}
+        {{- end}}
+        {{- if or .Values.pgbouncer.ssl.ca .Values.pgbouncer.ssl.cert .Values.pgbouncer.ssl.key }}
         - name: pgbouncer-certificates
           secret:
             secretName: {{ template "pgbouncer_certificates_secret" . }}
         {{- end }}
         {{- if .Values.volumes }}
-          {{- toYaml .Values.volumes | nindent 8 }}
+          {{- tpl (toYaml .Values.volumes) . | nindent 8 }}
         {{- end }}
         {{- if .Values.pgbouncer.extraVolumes }}
           {{- tpl (toYaml .Values.pgbouncer.extraVolumes) . | nindent 8 }}
         {{- end }}
+      {{- end }}
 {{- end }}

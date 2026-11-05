@@ -23,12 +23,13 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from airflow_breeze.utils.console import get_console
+from airflow_breeze.utils.console import console_print
 
 airflow_redirects_link = (
-    "https://raw.githubusercontent.com/apache/airflow/main/docs/apache-airflow/redirects.txt"
+    "https://raw.githubusercontent.com/{head_repo}/{head_ref}/airflow-core/docs/redirects.txt"
 )
-helm_redirects_link = "https://raw.githubusercontent.com/apache/airflow/main/docs/helm-chart/redirects.txt"
+
+helm_redirects_link = "https://raw.githubusercontent.com/{head_repo}/{head_ref}/docs/helm-chart/redirects.txt"
 
 
 def download_file(url):
@@ -41,17 +42,17 @@ def download_file(url):
         return True, file_name
     except URLError as e:
         if e.reason == "Not Found":
-            get_console().print(f"[blue]The {url} does not exist. Skipping.")
+            console_print(f"[blue]The {url} does not exist. Skipping.")
         else:
-            get_console().print(f"[yellow]Could not download file {url}: {e}")
+            console_print(f"[yellow]Could not download file {url}: {e}")
         return False, "no-file"
 
 
 def construct_old_to_new_tuple_mapping(file_name: Path) -> list[tuple[str, str]]:
     old_to_new_tuples: list[tuple[str, str]] = []
     with file_name.open() as f:
-        for line in f:
-            line = line.strip()
+        for line_raw in f:
+            line = line_raw.strip()
             if line and not line.startswith("#"):
                 old_path, new_path = line.split(" ")
                 old_path = old_path.replace(".rst", ".html")
@@ -64,17 +65,19 @@ def get_redirect_content(url: str):
     return f'<html><head><meta http-equiv="refresh" content="0; url={url}"/></head></html>'
 
 
-def get_github_redirects_url(provider_name: str):
-    return f"https://raw.githubusercontent.com/apache/airflow/main/docs/{provider_name}/redirects.txt"
+def get_github_provider_redirects_url(
+    provider_name: str, head_repo: str = "apache/airflow", head_ref: str = "main"
+) -> str:
+    return f"https://raw.githubusercontent.com/{head_repo}/{head_ref}/providers/{provider_name}/docs/redirects.txt"
 
 
 def crete_redirect_html_if_not_exist(path: Path, content: str):
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
-        get_console().print(f"[green]Created back reference redirect: {path}")
+        console_print(f"[green]Created back reference redirect: {path}")
     else:
-        get_console().print(f"Skipping file:{path}, redirects already exist")
+        console_print(f"Skipping file:{path}, redirects already exist")
 
 
 def create_back_reference_html(back_ref_url: str, target_path: Path):
@@ -83,7 +86,7 @@ def create_back_reference_html(back_ref_url: str, target_path: Path):
     version_match = re.compile(r"[0-9]+.[0-9]+.[0-9]+")
     target_path_as_posix = target_path.as_posix()
     if "/stable/" in target_path_as_posix:
-        prefix, postfix = target_path_as_posix.split("/stable/")
+        prefix, postfix = target_path_as_posix.split("/stable/", maxsplit=1)
         base_folder = Path(prefix)
         for folder in base_folder.iterdir():
             if folder.is_dir() and version_match.match(folder.name):
@@ -94,20 +97,20 @@ def create_back_reference_html(back_ref_url: str, target_path: Path):
 
 def generate_back_references(link: str, base_path: Path):
     if not base_path.exists():
-        get_console().print("[blue]The provider is not yet released.Skipping.")
+        console_print(f"[blue]The folder {base_path} does not exist. Skipping.")
         return
     is_downloaded, file_name = download_file(link)
     if not is_downloaded:
         old_to_new: list[tuple[str, str]] = []
     else:
-        get_console().print(f"Constructs old to new mapping from redirects.txt for {base_path}")
+        console_print(f"Constructs old to new mapping from redirects.txt for {base_path}")
         old_to_new = construct_old_to_new_tuple_mapping(file_name)
     old_to_new.append(("index.html", "changelog.html"))
     old_to_new.append(("index.html", "security.html"))
     old_to_new.append(("security.html", "security/security-model.html"))
 
     for versioned_provider_path in (p for p in base_path.iterdir() if p.is_dir()):
-        get_console().print(f"Processing {base_path}, version: {versioned_provider_path.name}")
+        console_print(f"Processing {base_path}, version: {versioned_provider_path.name}")
 
         for old, new in old_to_new:
             # only if old file exists, add the back reference
@@ -128,26 +131,43 @@ def generate_back_references(link: str, base_path: Path):
                 create_back_reference_html(relative_path, dest_file_path)
 
 
-def start_generating_back_references(airflow_site_directory: Path, short_provider_ids: list[str]):
+def start_generating_back_references(
+    airflow_site_directory: Path,
+    short_provider_ids: list[str],
+    head_repo: str = "apache/airflow",
+    head_ref: str = "main",
+):
+    airflow_redirects_url = airflow_redirects_link.format(head_repo=head_repo, head_ref=head_ref)
+    helm_redirects_url = helm_redirects_link.format(head_repo=head_repo, head_ref=head_ref)
+
     docs_archive_path = airflow_site_directory / "docs-archive"
     airflow_docs_path = docs_archive_path / "apache-airflow"
     helm_docs_path = docs_archive_path / "helm-chart"
     if "apache-airflow" in short_provider_ids:
-        generate_back_references(airflow_redirects_link, airflow_docs_path)
+        generate_back_references(airflow_redirects_url, airflow_docs_path)
         short_provider_ids.remove("apache-airflow")
     if "helm-chart" in short_provider_ids:
-        generate_back_references(helm_redirects_link, helm_docs_path)
+        generate_back_references(helm_redirects_url, helm_docs_path)
         short_provider_ids.remove("helm-chart")
     if "docker-stack" in short_provider_ids:
-        get_console().print("[info]Skipping docker-stack package. No back-reference needed.")
+        console_print("[info]Skipping docker-stack package. No back-reference needed.")
         short_provider_ids.remove("docker-stack")
     if "apache-airflow-providers" in short_provider_ids:
-        get_console().print("[info]Skipping apache-airflow-providers package. No back-reference needed.")
+        console_print("[info]Skipping apache-airflow-providers package. No back-reference needed.")
         short_provider_ids.remove("apache-airflow-providers")
+    if "apache-airflow-ctl" in short_provider_ids:
+        console_print("[info]Skipping airflowctl package. No back-reference needed.")
+        short_provider_ids.remove("apache-airflow-ctl")
+    if "apache-airflow-mypy" in short_provider_ids:
+        console_print("[info]Skipping apache-airflow-mypy package. No back-reference needed.")
+        short_provider_ids.remove("apache-airflow-mypy")
+
     if short_provider_ids:
-        all_providers = [
-            f"apache-airflow-providers-{package.replace('.','-')}" for package in short_provider_ids
-        ]
-        for p in all_providers:
-            get_console().print(f"Processing airflow provider: {p}")
-            generate_back_references(get_github_redirects_url(p), docs_archive_path / p)
+        for p in short_provider_ids:
+            slash_based_short_provider_id = p.replace(".", "/")
+            full_provider_name = f"apache-airflow-providers-{p.replace('.', '-')}"
+            console_print(f"Processing airflow provider: {full_provider_name}")
+            generate_back_references(
+                get_github_provider_redirects_url(slash_based_short_provider_id, head_repo, head_ref),
+                docs_archive_path / full_provider_name,
+            )

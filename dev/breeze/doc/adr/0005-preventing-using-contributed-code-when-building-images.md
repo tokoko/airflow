@@ -45,7 +45,7 @@ As described in [4. Using Docker images as test environment](0004-using-docker-i
 Airflow CI system uses CI Docker image as consistent test execution environment. This environment provides
 cacheability and rebuild capabilities that allow the image to be rebuilt quickly, incrementally based on
 previous version of the images - whenever any of the source code, Python dependencies, System dependencies
-are changed (in optimal way depending on the change). However, even with optimalizations, rebuilding
+are changed (in optimal way depending on the change). However, even with optimizations, rebuilding
 the image might take quite some time (when only sources change ~ 1 minute, but when system dependencies
 change ~ 10 minutes). In certain cases we run (for the same Python version) 20 jobs that require the same
 image as the environment, which in extreme cases would mean 20x10 = 200 build minutes on CI to
@@ -159,5 +159,5 @@ Thanks to combination of features available in GitHub, the builds are secured ag
 code by users contributing PRs, that could get uncontrolled write access to Airflow repository.
 
 The negative consequence of this is that the build process becomes much more complex
-(see [CI](../../../../CI.rst) for complete description) and that some cases (like modifying build behaviour
+(see [CI](../ci/README.md) for complete description) and that some cases (like modifying build behaviour
 require additional process of testing by pushing the changes as `main` branch to a fork of Apache Airflow)

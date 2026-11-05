@@ -47,8 +47,7 @@ SOURCE_DIR_PATH = os.path.abspath(os.path.join(MY_DIR_PATH, os.pardir))
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 500})
-def cli():
-    ...
+def cli(): ...
 
 
 def render_template_file(
@@ -148,7 +147,7 @@ option_repository = click.option(
 option_title = click.option(
     "--title",
     type=str,
-    required="true",
+    required=True,
     help="Title of the issues to create (might contain {{ name }} to indicate the name of the group)",
 )
 
@@ -229,7 +228,7 @@ def prepare_bulk_issues(
             except GithubException as e:
                 console.print(f"[red]Error!: {e}[/]")
                 console.print(
-                    f"[yellow]Restart with `--start-from {processed_issues+start_from}` to continue.[/]"
+                    f"[yellow]Restart with `--start-from {processed_issues + start_from}` to continue.[/]"
                 )
         console.print(f"Created {processed_issues} issue(s).")
 

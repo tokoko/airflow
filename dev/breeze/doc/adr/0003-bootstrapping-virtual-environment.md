@@ -68,7 +68,7 @@ of the user who is developing Airflow.
 
 ./Breeze should use the version of Breeze that is available in this version
 
-* git rebase --onto apache/main
+* git rebase --onto upstream/main
 
 ./Breeze should be automatically updated to the latest version available
 in main (including dependencies)
@@ -88,7 +88,7 @@ of the CI is stored in the same repository as the source code of the
 application it tests and part of the Breeze functions are shared with CI.
 
 In the future when breeze stabilizes and its update cadence will be
-much slower (which is likele as it happened with the Breeze predecessor)
+much slower (which is likely as it happened with the Breeze predecessor)
 there could be an option that Breeze is installed as separate package and
 same released Breeze version could be ued to manage multiple Airflow
 versions, for that we might want to release Breeze as a separate package
@@ -101,7 +101,7 @@ version of Breeze will remain as part of the Airflow's source code.
 The decision is to implement Breeze in a subfolder (`dev/breeze2/`) of
 Apache Airflow as a Python project following the standard setuptools
 enabled project. The project contains setup.py and dependencies described
-in setup.cfg and contains both source code and tests for Breeze code.
+in pyproject.toml and contains both source code and tests for Breeze code.
 
 The sub-project could be used in the future to produce a  PyPI package
 (we reserved such package in PyPI), however its main purpose is
@@ -116,7 +116,7 @@ of Airflow) performs the following tasks:
 
 * when run for the first time it creates `.build/breeze2/venv` virtual
   environment (Python3.6+ based) - with locally installed `dev`
-  project in editable mode (`pip install -e .`) - this makes sure
+  project in editable mode (`pip install -e ".[devel]"`) - this makes sure
   that the users of Breeze will use the latest version of Breeze
   available in their version of the repository
 * when run subsequently, it will check if setup files changed for
@@ -173,7 +173,7 @@ The alternatives considered were:
   additional tool that needs to be installed and it lacks
   the automation of checking and recreation of the virtualenv
   when needed (you need to manually run nox to update environment)
-  Alsoi it is targeted for building multiple virtualenv
+  Also it is targeted for building multiple virtualenv
   for tests - it has nice pytest integration for example, but it
   lacks support for managing editable installs for a long time.
 
@@ -203,5 +203,5 @@ having to install any prerequisites. The virtualenv used by
 breeze will be hidden from the user, and used behind the
 scenes - and the dependencies used will be automatically
 installed when needed. This will allow to seamlessly
-integrate Breeze tool in the develiopment experience without
+integrate Breeze tool in the development experience without
 having to worry about extra maintenance needed.

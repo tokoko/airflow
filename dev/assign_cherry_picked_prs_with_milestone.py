@@ -28,12 +28,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import rich_click as click
 from github import Github, UnknownObjectException
-from github.PullRequest import PullRequest
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 if TYPE_CHECKING:
     from github.Milestone import Milestone
+    from github.PullRequest import PullRequest
     from github.Repository import Repository
 
 CHANGELOG_SKIP_LABEL = "changelog:skip"
@@ -47,7 +47,6 @@ console = Console(width=400, color_system="standard")
 MY_DIR_PATH = os.path.dirname(__file__)
 SOURCE_DIR_PATH = os.path.abspath(os.path.join(MY_DIR_PATH, os.pardir))
 PR_PATTERN = re.compile(r".*\(#([0-9]+)\)")
-ISSUE_MATCH_IN_BODY = re.compile(r" #([0-9]+)[^0-9]")
 
 CHANGELOG_CHANGES_FILE = "changelog-changes.txt"
 DOC_ONLY_CHANGES_FILE = "doc-only-changes.txt"
@@ -55,8 +54,7 @@ EXCLUDED_CHANGES_FILE = "excluded-changes.txt"
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 500})
-def cli():
-    ...
+def cli(): ...
 
 
 option_verbose = click.option(
@@ -304,7 +302,7 @@ def assign_prs(
             # Fallback to issue if PR not found
             try:
                 # PR has almost the same fields as Issue
-                pr = cast(PullRequest, repo.get_issue(pr_number))
+                pr = cast("PullRequest", repo.get_issue(pr_number))
             except UnknownObjectException:
                 console.print(f"[red]The PR #{pr_number} could not be found[/]")
                 continue

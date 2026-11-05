@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from copy import copy
 from pathlib import Path
 from typing import Any
@@ -31,29 +32,39 @@ from click import Context
 from rich.console import Console
 
 from airflow_breeze import NAME, VERSION
-from airflow_breeze.commands.main_command import main
-from airflow_breeze.utils.cache import check_if_cache_exists, delete_cache, touch_cache_file
-from airflow_breeze.utils.click_utils import BreezeGroup
-from airflow_breeze.utils.common_options import (
+from airflow_breeze.commands.common_options import (
     option_answer,
     option_backend,
     option_dry_run,
-    option_mssql_version,
+    option_llm_model,
     option_mysql_version,
     option_postgres_version,
     option_python,
+    option_terminal_multiplexer,
     option_verbose,
 )
+from airflow_breeze.commands.developer_commands import option_auth_manager
+from airflow_breeze.commands.main_command import main
+from airflow_breeze.utils.cache import check_if_cache_exists, delete_cache, touch_cache_file
+from airflow_breeze.utils.click_utils import BreezeGroup
 from airflow_breeze.utils.confirm import STANDARD_TIMEOUT, Answer, user_confirm
-from airflow_breeze.utils.console import get_console, get_stderr_console
+from airflow_breeze.utils.console import console_print
 from airflow_breeze.utils.custom_param_types import BetterChoice
+from airflow_breeze.utils.docker_command_utils import VOLUMES_FOR_SELECTED_MOUNTS
 from airflow_breeze.utils.path_utils import (
-    AIRFLOW_SOURCES_ROOT,
+    AIRFLOW_ROOT_PATH,
+    BREEZE_IMAGES_PATH,
+    BREEZE_ROOT_PATH,
+    BREEZE_SOURCES_PATH,
+    SCRIPTS_CI_DOCKER_COMPOSE_LOCAL_YAML_PATH,
+    SUPPRESS_WORKTREE_ISOLATION_FILE,
+    WORKTREE_ISOLATION_ENV,
     get_installation_airflow_sources,
     get_installation_sources_config_metadata_hash,
-    get_package_setup_metadata_hash,
+    get_shared_build_cache_path,
     get_used_airflow_sources,
     get_used_sources_setup_metadata_hash,
+    is_worktree_isolation_enabled,
 )
 from airflow_breeze.utils.recording import generating_command_images
 from airflow_breeze.utils.reinstall import reinstall_breeze, warn_non_editable
@@ -63,7 +74,7 @@ from airflow_breeze.utils.visuals import ASCIIART, ASCIIART_STYLE
 
 
 @click.group(cls=BreezeGroup, name="setup", help="Tools that developers can use to configure Breeze")
-def setup():
+def setup_group():
     pass
 
 
@@ -74,10 +85,9 @@ def setup():
     help="Use current workdir Airflow sources for upgrade"
     + (f" rather than {get_installation_airflow_sources()}." if not generating_command_images() else "."),
 )
-@setup.command(
+@setup_group.command(
     name="self-upgrade",
-    help="Self upgrade Breeze. By default it re-installs Breeze "
-    f"from {get_installation_airflow_sources()}."
+    help=f"Self upgrade Breeze. By default it re-installs Breeze from {get_installation_airflow_sources()}."
     if not generating_command_images()
     else "Self upgrade Breeze.",
 )
@@ -94,7 +104,7 @@ def self_upgrade(use_current_airflow_sources: bool):
         sys.exit(1)
 
 
-@setup.command(name="autocomplete")
+@setup_group.command(name="autocomplete")
 @click.option(
     "-f",
     "--force",
@@ -110,16 +120,14 @@ def autocomplete(force: bool):
     """
     # Determine if the shell is bash/zsh/powershell. It helps to build the autocomplete path
     detected_shell = os.environ.get("SHELL")
-    detected_shell = None if detected_shell is None else detected_shell.split(os.sep)[-1]
+    detected_shell = None if detected_shell is None else Path(detected_shell).name
     if detected_shell not in ["bash", "zsh", "fish"]:
-        get_console().print(f"\n[error] The shell {detected_shell} is not supported for autocomplete![/]\n")
+        console_print(f"\n[error] The shell {detected_shell} is not supported for autocomplete![/]\n")
         sys.exit(1)
-    get_console().print(f"Installing {detected_shell} completion for local user")
-    autocomplete_path = (
-        AIRFLOW_SOURCES_ROOT / "dev" / "breeze" / "autocomplete" / f"{NAME}-complete-{detected_shell}.sh"
-    )
-    get_console().print(f"[info]Activation command script is available here: {autocomplete_path}[/]\n")
-    get_console().print(f"[warning]We need to add above script to your {detected_shell} profile.[/]\n")
+    console_print(f"Installing {detected_shell} completion for local user")
+    autocomplete_path = BREEZE_ROOT_PATH / "autocomplete" / f"{NAME}-complete-{detected_shell}.sh"
+    console_print(f"[info]Activation command script is available here: {autocomplete_path}[/]\n")
+    console_print(f"[warning]We need to add above script to your {detected_shell} profile.[/]\n")
     given_answer = user_confirm(
         "Should we proceed with modifying the script?", default_answer=Answer.NO, timeout=STANDARD_TIMEOUT
     )
@@ -136,7 +144,7 @@ def autocomplete(force: bool):
             # Include steps for fish shell
             script_path = str(Path("~").expanduser() / f".config/fish/completions/{NAME}.fish")
             if os.path.exists(script_path) and not force:
-                get_console().print(
+                console_print(
                     "\n[warning]Autocompletion is already setup. Skipping. "
                     "You can force autocomplete installation by adding --force/]\n"
                 )
@@ -153,7 +161,7 @@ def autocomplete(force: bool):
             command_to_execute = f". {autocomplete_path}"
             write_to_shell(command_to_execute=command_to_execute, script_path=script_path, force_setup=force)
     elif given_answer == Answer.NO:
-        get_console().print(
+        console_print(
             "\nPlease follow the https://click.palletsprojects.com/en/8.1.x/shell-completion/ "
             "to setup autocompletion for breeze manually if you want to use it.\n"
         )
@@ -161,35 +169,31 @@ def autocomplete(force: bool):
         sys.exit(0)
 
 
-@setup.command()
+@setup_group.command()
 @option_verbose
 @option_dry_run
 def version():
     """Print information about version of apache-airflow-breeze."""
 
-    get_console().print(ASCIIART, style=ASCIIART_STYLE)
-    get_console().print(f"\n[info]Breeze version: {VERSION}[/]")
-    get_console().print(f"[info]Breeze installed from: {get_installation_airflow_sources()}[/]")
-    get_console().print(f"[info]Used Airflow sources : {get_used_airflow_sources()}[/]\n")
+    console_print(ASCIIART, style=ASCIIART_STYLE)
+    console_print(f"\n[info]Breeze version: {VERSION}[/]")
+    console_print(f"[info]Breeze installed from: {get_installation_airflow_sources()}[/]")
+    console_print(f"[info]Used Airflow sources : {get_used_airflow_sources()}[/]\n")
     if get_verbose():
-        get_console().print(
-            f"[info]Installation sources config hash : "
-            f"{get_installation_sources_config_metadata_hash()}[/]"
+        console_print(
+            f"[info]Installation sources config hash : {get_installation_sources_config_metadata_hash()}[/]"
         )
-        get_console().print(
-            f"[info]Used sources config hash         : {get_used_sources_setup_metadata_hash()}[/]"
-        )
-        get_console().print(
-            f"[info]Package config hash              : {(get_package_setup_metadata_hash())}[/]\n"
-        )
+        console_print(f"[info]Used sources config hash         : {get_used_sources_setup_metadata_hash()}[/]")
 
 
-@setup.command(name="config")
+@setup_group.command(name="config")
 @option_python
 @option_backend
 @option_postgres_version
+@option_terminal_multiplexer
 @option_mysql_version
-@option_mssql_version
+@option_auth_manager
+@option_llm_model
 @click.option("-C/-c", "--cheatsheet/--no-cheatsheet", help="Enable/disable cheatsheet.", default=None)
 @click.option("-A/-a", "--asciiart/--no-asciiart", help="Enable/disable ASCIIart.", default=None)
 @click.option(
@@ -197,74 +201,146 @@ def version():
     help="Enable/disable Colour mode (useful for colour blind-friendly communication).",
     default=None,
 )
+@click.option(
+    "--worktree-isolation/--no-worktree-isolation",
+    help="Enable/disable a separate Docker Compose project for each git worktree of this checkout. "
+    f"Applies to every worktree; the {WORKTREE_ISOLATION_ENV} environment variable overrides it.",
+    default=None,
+)
 def change_config(
     python: str,
     backend: str,
+    terminal_multiplexer: str,
     postgres_version: str,
     mysql_version: str,
-    mssql_version: str,
+    auth_manager: str,
+    llm_model: str,
     cheatsheet: bool,
     asciiart: bool,
     colour: bool,
+    worktree_isolation: bool | None,
 ):
     """
-    Show/update configuration (Python, Backend, Cheatsheet, ASCIIART).
+    Show/update configuration (Python, Backend, Cheatsheet, ASCIIART, worktree isolation).
     """
     asciiart_file = "suppress_asciiart"
     cheatsheet_file = "suppress_cheatsheet"
     colour_file = "suppress_colour"
-
     if asciiart is not None:
         if asciiart:
             delete_cache(asciiart_file)
-            get_console().print("[info]Enable ASCIIART![/]")
+            console_print("[info]Enable ASCIIART[/]")
         else:
             touch_cache_file(asciiart_file)
-            get_console().print("[info]Disable ASCIIART![/]")
+            console_print("[info]Disable ASCIIART[/]")
     if cheatsheet is not None:
         if cheatsheet:
             delete_cache(cheatsheet_file)
-            get_console().print("[info]Enable Cheatsheet[/]")
+            console_print("[info]Enable Cheatsheet[/]")
         elif cheatsheet is not None:
             touch_cache_file(cheatsheet_file)
-            get_console().print("[info]Disable Cheatsheet[/]")
+            console_print("[info]Disable Cheatsheet[/]")
     if colour is not None:
         if colour:
             delete_cache(colour_file)
-            get_console().print("[info]Enable Colour[/]")
+            console_print("[info]Enable Colour[/]")
         elif colour is not None:
             touch_cache_file(colour_file)
-            get_console().print("[info]Disable Colour[/]")
+            console_print("[info]Disable Colour[/]")
 
-    def get_status(file: str):
+    if worktree_isolation is not None:
+        suppress_isolation_file = get_shared_build_cache_path() / SUPPRESS_WORKTREE_ISOLATION_FILE
+        if worktree_isolation:
+            suppress_isolation_file.unlink(missing_ok=True)
+            console_print("[info]Enable worktree isolation[/]")
+        else:
+            suppress_isolation_file.parent.mkdir(parents=True, exist_ok=True)
+            suppress_isolation_file.touch()
+            console_print("[info]Disable worktree isolation[/]")
+
+    def get_suppress_status(file: str):
         return "disabled" if check_if_cache_exists(file) else "enabled"
 
-    get_console().print()
-    get_console().print("[info]Current configuration:[/]")
-    get_console().print()
-    get_console().print(f"[info]* Python: {python}[/]")
-    get_console().print(f"[info]* Backend: {backend}[/]")
-    get_console().print()
-    get_console().print(f"[info]* Postgres version: {postgres_version}[/]")
-    get_console().print(f"[info]* MySQL version: {mysql_version}[/]")
-    get_console().print(f"[info]* MsSQL version: {mssql_version}[/]")
-    get_console().print()
-    get_console().print(f"[info]* ASCIIART: {get_status(asciiart_file)}[/]")
-    get_console().print(f"[info]* Cheatsheet: {get_status(cheatsheet_file)}[/]")
-    get_console().print()
-    get_console().print()
-    get_console().print(f"[info]* Colour: {get_status(colour_file)}[/]")
-    get_console().print()
+    console_print()
+    console_print("[info]Current configuration:[/]")
+    console_print()
+    console_print(f"[info]* Python: {python}[/]")
+    console_print(f"[info]* Backend: {backend}[/]")
+    console_print(f"[info]* Postgres version: {postgres_version}[/]")
+    console_print(f"[info]* MySQL version: {mysql_version}[/]")
+    console_print(f"[info]* Terminal multiplexer: {terminal_multiplexer}[/]")
+    console_print(f"[info]* Auth Manager: {auth_manager}[/]")
+    console_print(f"[info]* LLM Model: {llm_model}[/]")
+    console_print()
+    console_print(f"[info]* ASCIIART: {get_suppress_status(asciiart_file)}[/]")
+    console_print(f"[info]* Cheatsheet: {get_suppress_status(cheatsheet_file)}[/]")
+    console_print()
+    console_print(f"[info]* Colour: {get_suppress_status(colour_file)}[/]")
+    console_print()
+    isolation_status = "enabled" if is_worktree_isolation_enabled() else "disabled"
+    if os.environ.get(WORKTREE_ISOLATION_ENV):
+        isolation_status += f" (set by {WORKTREE_ISOLATION_ENV})"
+    console_print(f"[info]* Worktree isolation: {isolation_status}[/]")
+    console_print()
 
 
-def dict_hash(dictionary: dict[str, Any]) -> str:
-    """MD5 hash of a dictionary. Sorted and dumped via json to account for random sequence)"""
+def dedent_help(dictionary: dict[str, Any]) -> None:
+    """
+    Dedent help stored in the dictionary.
+
+    Python 3.13 automatically dedents docstrings retrieved from functions.
+    See https://github.com/python/cpython/issues/81283
+
+    However, click uses docstrings in the absence of help strings, and we are using click
+    command definition dictionary hash to detect changes in the command definitions, so if the
+    help strings are not dedented, the hash will change.
+
+    That's why we must de-dent all the help strings in the command definition dictionary
+    before we hash it.
+    """
+    for key, value in dictionary.items():
+        if isinstance(value, dict):
+            dedent_help(value)
+        elif key == "help" and isinstance(value, str):
+            dictionary[key] = textwrap.dedent(value)
+
+
+def recursively_sort_opts(object: dict[str, Any] | list[Any]) -> None:
+    if isinstance(object, dict):
+        for key in object:
+            if key == "opts" and isinstance(object[key], list):
+                object[key] = sorted(object[key])
+            elif isinstance(object[key], dict):
+                recursively_sort_opts(object[key])
+            elif isinstance(object[key], list):
+                recursively_sort_opts(object[key])
+    elif isinstance(object, list):
+        for element in object:
+            recursively_sort_opts(element)
+
+
+def dict_hash(dictionary: dict[str, Any], dedent_help_strings: bool = True, sort_opts: bool = True) -> str:
+    """
+    MD5 hash of a dictionary of configuration for click.
+
+    Sorted and dumped via json to account for random sequence of keys in the dictionary. Also it
+    implements a few corrections to the dict because click does not always keep the same sorting order in
+    options or produced differently indented help strings.
+
+    :param dictionary: dictionary to hash
+    :param dedent_help_strings: whether to dedent help strings before hashing
+    :param sort_opts: whether to sort options before hashing
+    """
+    if dedent_help_strings:
+        dedent_help(dictionary)
+    if sort_opts:
+        recursively_sort_opts(dictionary)
     # noinspection InsecureHash
     dhash = hashlib.md5()
     try:
         encoded = json.dumps(dictionary, sort_keys=True, default=vars).encode()
     except TypeError:
-        get_console().print(dictionary)
+        console_print(dictionary)
         raise
     dhash.update(encoded)
     return dhash.hexdigest()
@@ -286,7 +362,7 @@ def validate_params_for_command(command_params, command):
                         options_command_map[opt] = [[command, name]]
                     else:
                         # same flag used in same command
-                        get_console().print(
+                        console_print(
                             f"[error] {opt} short flag has duplicate short hand commands under command(s): "
                             f"{'breeze ' + command} for parameters "
                             f"{options_command_map[opt][0][1]} and {name}\n"
@@ -302,8 +378,6 @@ def get_command_hash_dict() -> dict[str, str]:
     hashes: dict[str, str] = {}
     with Context(main) as ctx:
         the_context_dict = ctx.to_info_dict()
-        if get_verbose():
-            get_stderr_console().print(the_context_dict)
         commands_dict = the_context_dict["command"]["commands"]
         options = rich_click.rich_click.OPTION_GROUPS
         for command in sorted(commands_dict.keys()):
@@ -327,6 +401,9 @@ def get_command_hash_dict() -> dict[str, str]:
                 hashes[f"{command}"] = dict_hash(current_command_dict) + "\n"
             duplicate_found_subcommand = False
             for subcommand in sorted(subcommands.keys()):
+                # Skip hidden commands (e.g., deprecated aliases) from image generation
+                if subcommands[subcommand].get("hidden", False):
+                    continue
                 duplicate_found = validate_params_for_command(
                     commands_dict[command]["commands"][subcommand], command + " " + subcommand
                 )
@@ -336,10 +413,10 @@ def get_command_hash_dict() -> dict[str, str]:
                 try:
                     subcommand_rich_click_dict = options[f"breeze {command} {subcommand}"]
                 except KeyError:
-                    get_console().print(
+                    console_print(
                         f"[error]The `breeze {command} {subcommand}` is missing in rich-click options[/]"
                     )
-                    get_console().print(
+                    console_print(
                         "[info]Please add it to rich_click.OPTION_GROUPS "
                         "via one of the `*_commands_config.py` "
                         "files in `dev/breeze/src/airflow_breeze/commands`[/]"
@@ -363,23 +440,22 @@ def write_to_shell(command_to_execute: str, script_path: str, force_setup: bool)
     if not skip_check:
         if BREEZE_COMMENT in script_path_file.read_text():
             if not force_setup:
-                get_console().print(
+                console_print(
                     "\n[warning]Autocompletion is already setup. Skipping. "
                     "You can force autocomplete installation by adding --force[/]\n"
                 )
                 return False
-            else:
-                backup(script_path_file)
-                remove_autogenerated_code(script_path)
+            backup(script_path_file)
+            remove_autogenerated_code(script_path)
     text = ""
     if script_path_file.exists():
-        get_console().print(f"\nModifying the {script_path} file!\n")
-        get_console().print(f"\nCopy of the original file is held in {script_path}.bak !\n")
+        console_print(f"\nModifying the {script_path} file!\n")
+        console_print(f"\nCopy of the original file is held in {script_path}.bak !\n")
         if not get_dry_run():
             backup(script_path_file)
             text = script_path_file.read_text()
     else:
-        get_console().print(f"\nCreating the {script_path} file!\n")
+        console_print(f"\nCreating the {script_path} file!\n")
     if not get_dry_run():
         script_path_file.write_text(
             text
@@ -390,10 +466,8 @@ def write_to_shell(command_to_execute: str, script_path: str, force_setup: bool)
             + END_LINE
         )
     else:
-        get_console().print(f"[info]The autocomplete script would be added to {script_path}[/]")
-    get_console().print(
-        f"\n[warning]Please exit and re-enter your shell or run:[/]\n\n   source {script_path}\n"
-    )
+        console_print(f"[info]The autocomplete script would be added to {script_path}[/]")
+    console_print(f"\n[warning]Please exit and re-enter your shell or run:[/]\n\n   source {script_path}\n")
     return True
 
 
@@ -420,14 +494,9 @@ def backup(script_path_file: Path):
     shutil.copy(str(script_path_file), str(script_path_file) + ".bak")
 
 
-BREEZE_IMAGES_DIR = AIRFLOW_SOURCES_ROOT / "images" / "breeze"
-BREEZE_INSTALL_DIR = AIRFLOW_SOURCES_ROOT / "dev" / "breeze"
-BREEZE_SOURCES_DIR = BREEZE_INSTALL_DIR / "src"
-
-
 def get_old_command_hash() -> dict[str, str]:
     command_hash = {}
-    for file in BREEZE_IMAGES_DIR.glob("output_*.txt"):
+    for file in BREEZE_IMAGES_PATH.glob("output_*.txt"):
         command = ":".join(file.name.split("_")[1:])[:-4]
         command_hash[command] = file.read_text()
     return command_hash
@@ -450,10 +519,10 @@ def regenerate_help_images_for_all_commands(commands: tuple[str, ...], check_onl
         console.print("[error]The --check-only flag cannot be used with --command flag.")
         return 2
     env = os.environ.copy()
-    env["AIRFLOW_SOURCES_ROOT"] = str(AIRFLOW_SOURCES_ROOT)
+    env["AIRFLOW_ROOT_PATH"] = str(AIRFLOW_ROOT_PATH)
     env["RECORD_BREEZE_WIDTH"] = SCREENSHOT_WIDTH
     env["TERM"] = "xterm-256color"
-    env["PYTHONPATH"] = str(BREEZE_SOURCES_DIR)
+    env["PYTHONPATH"] = str(BREEZE_SOURCES_PATH)
     new_hash_dict = get_command_hash_dict()
     regenerate_all_commands = False
     commands_list = list(commands)
@@ -491,7 +560,7 @@ def regenerate_help_images_for_all_commands(commands: tuple[str, ...], check_onl
         regenerate_all_commands = True
     if regenerate_all_commands:
         env["RECORD_BREEZE_TITLE"] = "Breeze commands"
-        env["RECORD_BREEZE_OUTPUT_FILE"] = str(BREEZE_IMAGES_DIR / "output-commands.svg")
+        env["RECORD_BREEZE_OUTPUT_FILE"] = str(BREEZE_IMAGES_PATH / "output-commands.svg")
         env["RECORD_BREEZE_UNIQUE_ID"] = "breeze-help"
         run_command(
             ["breeze", "--help"],
@@ -501,25 +570,41 @@ def regenerate_help_images_for_all_commands(commands: tuple[str, ...], check_onl
         if command != "main":
             subcommands = command.split(":")
             env["RECORD_BREEZE_TITLE"] = f"Command: {' '.join(subcommands)}"
-            env["RECORD_BREEZE_OUTPUT_FILE"] = str(BREEZE_IMAGES_DIR / f"output_{'_'.join(subcommands)}.svg")
+            env["RECORD_BREEZE_OUTPUT_FILE"] = str(BREEZE_IMAGES_PATH / f"output_{'_'.join(subcommands)}.svg")
             env["RECORD_BREEZE_UNIQUE_ID"] = f"breeze-{'-'.join(subcommands)}"
             run_command(["breeze", *subcommands, "--help"], env=env)
     if regenerate_all_commands:
         for command, hash_txt in new_hash_dict.items():
-            (BREEZE_IMAGES_DIR / f"output_{'_'.join(command.split(':'))}.txt").write_text(hash_txt)
-        get_console().print("\n[info]New hash of breeze commands written\n")
+            (BREEZE_IMAGES_PATH / f"output_{'_'.join(command.split(':'))}.txt").write_text(hash_txt)
+        console_print("\n[info]New hash of breeze commands written\n")
     return 1
 
 
 COMMON_PARAM_NAMES = ["--help", "--verbose", "--dry-run", "--answer"]
 COMMAND_PATH_PREFIX = "dev/breeze/src/airflow_breeze/commands/"
 
+DEVELOPER_COMMANDS = [
+    "start-airflow",
+    "build-docs",
+    "down",
+    "exec",
+    "shell",
+    "run",
+    "cleanup",
+    "generate-migration-file",
+    "doctor",
+]
+
 
 def command_path(command: str) -> str:
+    if command in DEVELOPER_COMMANDS:
+        return COMMAND_PATH_PREFIX + "developer_commands.py"
     return COMMAND_PATH_PREFIX + command.replace("-", "_") + "_commands.py"
 
 
 def command_path_config(command: str) -> str:
+    if command in DEVELOPER_COMMANDS:
+        return COMMAND_PATH_PREFIX + "developer_commands_config.py"
     return COMMAND_PATH_PREFIX + command.replace("-", "_") + "_commands_config.py"
 
 
@@ -533,7 +618,7 @@ def find_options_in_options_list(option: str, option_list: list[list[str]]) -> i
 def errors_detected_in_params(command: str, subcommand: str | None, command_dict: dict[str, Any]) -> bool:
     import rich_click
 
-    get_console().print(
+    console_print(
         f"[info]Checking if params are in groups for specified command :{command}"
         + (f" {subcommand}." if subcommand else ".")
     )
@@ -541,11 +626,11 @@ def errors_detected_in_params(command: str, subcommand: str | None, command_dict
     options = rich_click.rich_click.OPTION_GROUPS
     rich_click_key = "breeze " + command + (f" {subcommand}" if subcommand else "")
     if rich_click_key not in options:
-        get_console().print(
+        console_print(
             f"[error]The command `{rich_click_key}` not found in dictionaries "
             f"defined in rich click configuration."
         )
-        get_console().print(f"[warning]Please add it to the `{command_path_config(command)}`.")
+        console_print(f"[warning]Please add it to the `{command_path_config(command)}`.")
         return True
     rich_click_param_groups = options[rich_click_key]
     defined_param_names = [
@@ -558,12 +643,12 @@ def errors_detected_in_params(command: str, subcommand: str | None, command_dict
                 if index is not None:
                     del defined_param_names[index]
                 else:
-                    get_console().print(
+                    console_print(
                         f"[error]Parameter `{param}` is not defined as option in {command_path(command)} in "
                         f"`{rich_click_key}`, but is present in the "
                         f"`{rich_click_key}` group in `{command_path_config(command)}`."
                     )
-                    get_console().print(
+                    console_print(
                         "[warning]Please remove it from there or add parameter in "
                         "the command. NOTE! This error might be printed when the option is"
                         "added twice in the command definition!."
@@ -575,12 +660,12 @@ def errors_detected_in_params(command: str, subcommand: str | None, command_dict
             del defined_param_names[index]
     if defined_param_names:
         for param in defined_param_names:
-            get_console().print(
+            console_print(
                 f"[error]Parameter `{param}` is defined in `{command_path(command)}` in "
                 f"`{rich_click_key}`, but does not belong to any group options "
                 f"in `{rich_click_key}` group in `{command_path_config(command)}` and is not common."
             )
-            get_console().print("[warning]Please add it to relevant group or create new group there.")
+            console_print("[warning]Please add it to relevant group or create new group there.")
         errors_detected = True
     return errors_detected
 
@@ -588,10 +673,10 @@ def errors_detected_in_params(command: str, subcommand: str | None, command_dict
 def check_that_all_params_are_in_groups(commands: tuple[str, ...]) -> int:
     Console(width=int(SCREENSHOT_WIDTH), color_system="standard")
     env = os.environ.copy()
-    env["AIRFLOW_SOURCES_ROOT"] = str(AIRFLOW_SOURCES_ROOT)
+    env["AIRFLOW_ROOT_PATH"] = str(AIRFLOW_ROOT_PATH)
     env["RECORD_BREEZE_WIDTH"] = SCREENSHOT_WIDTH
     env["TERM"] = "xterm-256color"
-    env["PYTHONPATH"] = str(BREEZE_SOURCES_DIR)
+    env["PYTHONPATH"] = str(BREEZE_SOURCES_PATH)
     with Context(main) as ctx:
         the_context_dict = ctx.to_info_dict()
     commands_dict = the_context_dict["command"]["commands"]
@@ -605,6 +690,9 @@ def check_that_all_params_are_in_groups(commands: tuple[str, ...]) -> int:
         if "commands" in current_command_dict:
             subcommands = current_command_dict["commands"]
             for subcommand in sorted(subcommands.keys()):
+                # Skip hidden commands (e.g., deprecated aliases) from param group validation
+                if subcommands[subcommand].get("hidden", False):
+                    continue
                 if errors_detected_in_params(command, subcommand, subcommands[subcommand]):
                     errors_detected = True
         else:
@@ -613,7 +701,7 @@ def check_that_all_params_are_in_groups(commands: tuple[str, ...]) -> int:
     return 1 if errors_detected else 0
 
 
-@setup.command(name="regenerate-command-images", help="Regenerate breeze command images.")
+@setup_group.command(name="regenerate-command-images", help="Regenerate breeze command images.")
 @click.option("--force", is_flag=True, help="Forces regeneration of all images", envvar="FORCE")
 @click.option(
     "--check-only",
@@ -638,7 +726,7 @@ def regenerate_command_images(command: tuple[str, ...], force: bool, check_only:
     sys.exit(return_code)
 
 
-@setup.command(name="check-all-params-in-groups", help="Check that all parameters are put in groups.")
+@setup_group.command(name="check-all-params-in-groups", help="Check that all parameters are put in groups.")
 @click.option(
     "--command",
     help="Command(s) to regenerate images for (optional, might be repeated)",
@@ -651,3 +739,50 @@ def regenerate_command_images(command: tuple[str, ...], force: bool, check_only:
 def check_all_params_in_groups(command: tuple[str, ...]):
     return_code = check_that_all_params_are_in_groups(commands=command)
     sys.exit(return_code)
+
+
+def _insert_documentation(file_path: Path, content: list[str], header: str, footer: str):
+    text = file_path.read_text().splitlines(keepends=True)
+    replacing = False
+    result: list[str] = []
+    for line in text:
+        if line.strip().startswith(header.strip()):
+            replacing = True
+            result.append(line)
+            result.extend(content)
+        if line.strip().startswith(footer.strip()):
+            replacing = False
+        if not replacing:
+            result.append(line)
+    src = "".join(result)
+    file_path.write_text(src)
+
+
+@setup_group.command(
+    name="synchronize-local-mounts",
+    help="Synchronize local mounts between python files and docker compose yamls.",
+)
+@option_verbose
+@option_dry_run
+def synchronize_local_mounts():
+    console_print("[info]Synchronizing local mounts between python files and docker compose yamls.[/]")
+    mounts_header = (
+        "        # START automatically generated volumes from "
+        "VOLUMES_FOR_SELECTED_MOUNTS in docker_command_utils.py"
+    )
+    mounts_footer = (
+        "        # END automatically generated volumes from "
+        "VOLUMES_FOR_SELECTED_MOUNTS in docker_command_utils.py"
+    )
+    prefix = "      "
+    volumes = []
+    for src, dest in VOLUMES_FOR_SELECTED_MOUNTS:
+        volumes.extend(
+            [
+                prefix + "- type: bind\n",
+                prefix + f"  source: ../../../{src}\n",
+                prefix + f"  target: {dest}\n",
+            ]
+        )
+    _insert_documentation(SCRIPTS_CI_DOCKER_COMPOSE_LOCAL_YAML_PATH, volumes, mounts_header, mounts_footer)
+    console_print("[success]Synchronized local mounts.[/]")

@@ -17,10 +17,10 @@
  under the License.
 */}}
 
-################################
+############################
 ## Airflow Scheduler Service
-#################################
-{{- if or (eq .Values.executor "LocalExecutor") (eq .Values.executor "LocalKubernetesExecutor") }}
+############################
+{{- if and .Values.scheduler.enabled (contains "LocalExecutor" .Values.executor) }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -31,7 +31,7 @@ metadata:
     release: {{ .Release.Name }}
     chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
     heritage: {{ .Release.Service }}
-    {{- if or (.Values.labels) (.Values.scheduler.labels) }}
+    {{- if or .Values.labels .Values.scheduler.labels }}
       {{- mustMerge .Values.scheduler.labels .Values.labels | toYaml | nindent 4 }}
     {{- end }}
 spec:
@@ -45,4 +45,10 @@ spec:
       protocol: TCP
       port: {{ .Values.ports.workerLogs }}
       targetPort: {{ .Values.ports.workerLogs }}
+  {{- if .Values.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ .Values.ipFamilyPolicy }}
+  {{- end }}
+  {{- if .Values.ipFamilies }}
+  ipFamilies: {{- toYaml .Values.ipFamilies | nindent 4 }}
+  {{- end }}
 {{- end }}

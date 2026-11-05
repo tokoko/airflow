@@ -20,7 +20,7 @@
 ################################
 ## Airflow StatsD ConfigMap
 #################################
-{{- if and .Values.statsd.enabled }}
+{{- if .Values.statsd.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -44,9 +44,13 @@ data:
     mappings:
       {{- toYaml .Values.statsd.overrideMappings | nindent 6 }}
     {{- else }}
-      {{- .Files.Get "files/statsd-mappings.yml" | nindent 4 }}
+      {{- tpl (.Files.Get "files/statsd-mappings.yml") . | nindent 4 }}
       {{- if .Values.statsd.extraMappings }}
         {{- toYaml .Values.statsd.extraMappings | nindent 6 }}
       {{- end }}
+    {{- end }}
+    {{- if .Values.statsd.cache.ttl }}
+    defaults:
+      ttl: {{ .Values.statsd.cache.ttl }}
     {{- end }}
 {{- end }}

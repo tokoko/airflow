@@ -23,18 +23,16 @@
 
 - [Purpose of the document](#purpose-of-the-document)
 - [Automated image cache and constraints refreshing in CI](#automated-image-cache-and-constraints-refreshing-in-ci)
-- [Figuring out backtracking dependencies](#figuring-out-backtracking-dependencies)
-  - [Why we need to figure out backtracking dependencies](#why-we-need-to-figure-out-backtracking-dependencies)
-  - [How to figure out backtracking dependencies](#how-to-figure-out-backtracking-dependencies)
-  - [Example backtracking session](#example-backtracking-session)
 - [Manually refreshing the image cache](#manually-refreshing-the-image-cache)
   - [Why we need to update image cache manually](#why-we-need-to-update-image-cache-manually)
-  - [Prerequisites](#prerequisites)
-  - [How to refresh the image cache](#how-to-refresh-the-image-cache)
+  - [How to refresh the image cache via the CI workflow (recommended)](#how-to-refresh-the-image-cache-via-the-ci-workflow-recommended)
+  - [Prerequisites for refreshing locally](#prerequisites-for-refreshing-locally)
+  - [How to refresh the image cache locally](#how-to-refresh-the-image-cache-locally)
   - [Is it safe to refresh the image cache?](#is-it-safe-to-refresh-the-image-cache)
   - [What the command does](#what-the-command-does)
 - [Manually generating constraint files](#manually-generating-constraint-files)
   - [Why we need to generate constraint files manually](#why-we-need-to-generate-constraint-files-manually)
+  - [How to refresh constraints via the CI workflow (recommended)](#how-to-refresh-constraints-via-the-ci-workflow-recommended)
   - [How to generate constraint files](#how-to-generate-constraint-files)
   - [Is it safe to generate constraints manually?](#is-it-safe-to-generate-constraints-manually)
 - [Manually updating already tagged constraint files](#manually-updating-already-tagged-constraint-files)
@@ -59,242 +57,73 @@ and users:
 * `Constraints files` - used by both, CI jobs (to fix the versions of dependencies used by CI jobs in regular
   PRs) and used by our users to reproducibly install released airflow versions.
 
-Normally, both are updated and refreshed automatically via [CI system](../CI.rst). However, there are some
-cases where we need to update them manually. This document describes how to do it.
+Normally, both are updated and refreshed automatically via [CI system](../dev/breeze/doc/ci/README.md).
+However, there are some cases where we need to update them manually. This document describes how to do it.
 
 # Automated image cache and constraints refreshing in CI
 
-Our [CI system](../CI.rst) is build in the way that it self-maintains. Regular scheduled builds and
+Our [CI](../dev/breeze/doc/ci/README.md) is build in the way that it self-maintains. Regular scheduled builds and
 merges to `main` branch builds (also known as `canary` builds) have separate maintenance step that
 take care about refreshing the cache that is used to speed up our builds and to speed up
-rebuilding of [Breeze](../BREEZE.rst) images for development purpose. This is all happening automatically, usually:
+rebuilding of [Breeze](./breeze/doc/README.rst) images for development purpose. This is all happening automatically, usually:
 
-* The latest [constraints](../CONTRIBUTING.rst#pinned-constraint-files) are pushed to appropriate branch after all tests succeed in the
+* The latest [constraints](/contributing-docs/13_airflow_dependencies_and_extras.rst#pinned-constraint-files) are pushed to appropriate branch after all tests succeed in the
   `canary` build.
 
-* The [images](../IMAGES.rst) in `ghcr.io` registry are refreshed early at the beginning of the `canary` build. This
-  is done twice during the canary build:
-   * By the `Push Early Image Cache` job that is run at the beginning of the `canary` build. This cover the
-     case when there are new dependencies added or Dockerfile/scripts change. Thanks to that step, subsequent
-     PRs will be faster when they use the new Dockerfile/script. Those jobs **might fail** occasionally,
-     if the latest PR added some conflicting dependencies with current constraints. This is not a problem
-     and when it happens, it will be fixed by the next step.
-   * By the `Push Image Cache` job that is run at the end of the `canary` build. This covers the case when
-     cache is also refreshed after than `main` build succeeds after the new constraints are pushed. This
-     step makes sure that constraints are committed and pushed just before the cache is refreshed, so
-     there is no problem with conflicting dependencies.
+* The [images](breeze/doc/ci/02_images.md) in `ghcr.io` registry are refreshed by the `Push Image Cache`
+  job at the end of the `canary` build, once the tests have passed. Running it last is what makes the
+  constraints and the cache agree: the constraints are committed and pushed just before the cache is
+  refreshed from them.
 
+* Branches that are built on `push` rather than by the scheduled `canary` -- the release-prep
+  (`vX-Y-test`) and providers branches -- are refreshed by the
+  [`Refresh image registry cache`](../.github/workflows/refresh-image-registry-cache.yml) workflow
+  instead. It runs on its own rather than inside the CI run, because the CI run is cancelled by the
+  next push and a cache refresh that keeps being cancelled never lands. It covers every Python version
+  on both platforms, and it is the same workflow you run by hand (see below).
 
-# Figuring out backtracking dependencies
-
-## Why we need to figure out backtracking dependencies
-
-Sometimes, very rarely the CI image in `canary` builds take a very long time to build. This is usually
-caused by `pip` trying to figure out the latest set of dependencies (`eager upgrade`) .
-The resolution of dependencies is a very complex problem and sometimes it takes a long time to figure out
-the best set of dependencies. This is especially true when we have a lot of dependencies and they all have
-to be found compatible with each other. In case new dependencies are released, sometimes `pip` enters
-a long loop trying to figure out if the newly released dependency can be used, but due to some other
-dependencies of ours it is impossible, but it will take `pip` a very long time to figure it out.
-
-This is visible in the "build output" as `pip` attempting to continuously backtrack and download many new
-versions of various dependencies, trying to find a good match.
-
-This is why we sometimes we need to help pip to skip newer versions of those dependencies, until the
-condition that caused the backtracking is solved.
-
-We do it by adding `dependency<=version` to the EAGER_UPGRADE_ADDITIONAL_REQUIREMENTS variable in
-`Dockerfile.ci`. The trick is to find the dependency that is causing the backtracking.
-
-Here is how. We use `bisecting` methodology to try out candidates for backtrack triggering among the
-candidates that have been released in PyPI since the last time we successfully run
-``--upgrade-to-newer-dependencies`` and committed the constraints in the `canary` build.
-
-## How to figure out backtracking dependencies
-
-First - we have a breeze command that can help us with that:
-
-```bash
-breeze ci find-backtracking-candidates
-```
-
-This command should be run rather quickly after we notice that the CI build is taking a long time and fail,
-because it is based on the fact that eager upgrade produced valid constraints at some point of time and
-it tries to find out what dependencies have been added since then and limit them to the version that
-was used in the constraints.
-
-You can also - instead of running the command manually rely on the failing CI builds. We run the
-`find-backtracking-candidates` command in the `canary` build when it times out, so the
-easiest way to find backtracking candidates is to find the first build that failed with timeout - it
-will likely have the smallest number of backtracking candidates. The command outputs the limitation
-for those backtracking candidates that are guaranteed to work (because they are taken from the latest
-constraints and they already succeeded in the past when the constraints were updated).
-
-Then we run ``breeze ci-image build --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "REQUIREMENTS"``
-to check which of the candidates causes the long builds. Initially you put there the whole list of
-candidates that you got from the `find-backtracking-candidates` command. This **should** succeed. Now,
-the next step is to narrow down the list of candidates to the one that is causing the backtracking.
-
-We narrow-down the list by "bisecting" the list. We remove half of the dependency limits and see if it
-still works or not. It works - we continue. If it does not work, we restore the removed half and remove
-the other half. Rinse and repeat until there is only one dependency left - hopefully
-(sometimes you will need to leave few of them).
-
-This way we can relatively quickly narrow down the dependency that is causing the backtracking. Once we
-figure out which dependency is causing it, we can attempt to figure it out why it is causing the backtracking
-by specifying the latest released version of the dependency as `== <latest released version>` in the
-`--eager-upgrade-additional-requirements`. This should rather quickly fail and `pip` should show us what
-the dependency is conflicting with. There might be multiple reasons for that. Most often it is simply
-a dependency that has a requirement that is limited and we need to wait until new version of that
-dependency is released.
-
-Note that - such build **might** even succeed - surprisingly. Then this is simply a sign that `pip`
-algorithm for `--eager-upgrade` was not perfect and the solution could be found given sufficient time.
-In such case it might also be that removing the limit in the next few days will not cause the backtracking.
-
-Finally, in order to make the change permanent in our CI builds, we should add the limitation to the
-`EAGER_UPGRADE_ADDITIONAL_REQUIREMENTS` arg in `Dockerfile.ci` and commit the change. We usually commit
-the limits with `<VERSION` suffix (where version is the version that causes backtracking - usually that will
-be the latest released version, unless that dependency had quick subsequent releases - you can try it before
-committing by simply adding it to `EAGER_UPGRADE_ADDITIONAL_REQUIREMENTS` in Dockerfile.ci and
-running `breeze ci-image build --upgrade-to-newer-dependencies`. Make sure to add the comment explaining
-when we should remove the limit.
-
-
-Later on - periodically we might attempt to remove the limitation and see if the backtracking is still
-happening. If it is not - we just remove the limitation from `Dockerfile.ci` and commit the change.
-
-## Example backtracking session
-
-This is the example backtracking session run on 13th of August 2023 after the `canary` CI image build
-started to fail with timeout a day before.
-
-1. The `breeze ci-image build --upgrade-to-newer-dependencies` failed on CI after 80 minutes.
-
-2. The output of the `breeze ci find-backtracking-candidates` command:
-
-```
-Last constraint date: 2023-08-09 21:48:23
-Latest version aiobotocore==2.6.0 release date: 2023-08-11 20:43:19. In current constraints: 2.5.4)
-Latest version asana==4.0.5 release date: 2023-08-11 18:56:04. In current constraints: 3.2.1)
-Latest version async-timeout==4.0.3 release date: 2023-08-10 16:35:55. In current constraints: 4.0.2)
-Latest version aws-sam-translator==1.73.0 release date: 2023-08-10 00:01:00. In current constraints: 1.72.0)
-Latest version azure-core==1.29.1 release date: 2023-08-10 05:09:59. In current constraints: 1.29.0)
-Latest version azure-cosmos==4.5.0 release date: 2023-08-09 23:43:07. In current constraints: 4.4.0)
-Latest version boto3==1.28.25 release date: 2023-08-11 19:23:52. In current constraints: 1.28.17)
-Latest version botocore==1.31.25 release date: 2023-08-11 19:23:34. In current constraints: 1.31.17)
-Latest version cfgv==3.4.0 release date: 2023-08-12 20:38:16. In current constraints: 3.3.1)
-Latest version coverage==7.3.0 release date: 2023-08-12 18:34:06. In current constraints: 7.2.7)
-Latest version databricks-sql-connector==2.9.1 release date: 2023-08-11 17:32:12. In current constraints: 2.8.0)
-Latest version google-ads==21.3.0 release date: 2023-08-10 18:10:22. In current constraints: 21.2.0)
-Latest version google-cloud-aiplatform==1.30.1 release date: 2023-08-11 21:19:50. In current constraints: 1.29.0)
-Latest version grpcio-status==1.57.0 release date: 2023-08-10 15:54:17. In current constraints: 1.56.2)
-Latest version grpcio==1.57.0 release date: 2023-08-10 15:51:52. In current constraints: 1.56.2)
-Latest version mypy==1.5.0 release date: 2023-08-10 12:46:43. In current constraints: 1.2.0)
-Latest version pyzmq==25.1.1 release date: 2023-08-10 09:01:18. In current constraints: 25.1.0)
-Latest version tornado==6.3.3 release date: 2023-08-11 15:21:47. In current constraints: 6.3.2)
-Latest version tqdm==4.66.1 release date: 2023-08-10 11:38:57. In current constraints: 4.66.0)
-Latest version virtualenv==20.24.3 release date: 2023-08-11 15:52:32. In current constraints: 20.24.1)
-
-Found 20 candidates for backtracking
-
-Run `breeze ci-image --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "aiobotocore<=2.5.4 asana<=3.2.1 async-timeout<=4.0.2 aws-sam-translator<=1.72.0 azure-core<=1.29.0
-azure-cosmos<=4.4.0 boto3<=1.28.17 botocore<=1.31.17 cfgv<=3.3.1 coverage<=7.2.7 databricks-sql-connector<=2.8.0 google-ads<=21.2.0 google-cloud-aiplatform<=1.29.0 grpcio-status<=1.56.2 grpcio<=1.56.2
-mypy<=1.2.0 pyzmq<=25.1.0 tornado<=6.3.2 tqdm<=4.66.0 virtualenv<=20.24.1"`. It should succeed.
-```
-
-3. As instructed, run:
-
-```bash
-breeze ci-image build --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "\
-aiobotocore<=2.5.4 asana<=3.2.1 async-timeout<=4.0.2 aws-sam-translator<=1.72.0 \
-azure-core<=1.29.0 azure-cosmos<=4.4.0 boto3<=1.28.17 botocore<=1.31.17 cfgv<=3.3.1 coverage<=7.2.7 \
-databricks-sql-connector<=2.8.0 google-ads<=21.2.0 google-cloud-aiplatform<=1.29.0 \
-grpcio-status<=1.56.2 grpcio<=1.56.2 mypy<=1.2.0 pyzmq<=25.1.0 tornado<=6.3.2 tqdm<=4.66.0 virtualenv<=20.24.1"
-```
-
-The build succeeded in ~ 8 minutes.
-
-4. Removed the second half:
-
-```
-breeze ci-image build --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "\
-aiobotocore<=2.5.4 asana<=3.2.1 async-timeout<=4.0.2 aws-sam-translator<=1.72.0 \
-azure-core<=1.29.0 azure-cosmos<=4.4.0 boto3<=1.28.17 botocore<=1.31.17 cfgv<=3.3.1 coverage<=7.2.7"
-```
-
-The build succeeded in ~ 8 minutes.
-
-5. Removed the second half:
-
-```
-breeze ci-image build --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "\
-aiobotocore<=2.5.4 asana<=3.2.1 async-timeout<=4.0.2 aws-sam-translator<=1.72.0"
-```
-
-The build succeeded in ~ 8 minutes.
-
-6. Removed the second half:
-
-```
-breeze ci-image build --upgrade-to-newer-dependencies \
---eager-upgrade-additional-requirements "aiobotocore<=2.5.4 asana<=3.2.1"
-```
-
-The build succeeded in ~ 8 minutes.
-
-6. Removed aiobotocore
-
-```
-asana<=3.2.1
-```
-
-The image build continued running way past 10 minutes and downloading many versions  of many dependencies.
-
-7. Removed asana and restored aiobotocore
-
-```
-aiobotocore<=2.5.4
-```
-
-The build succeeded. Aiobotocore is our culprit.
-
-8. Check the reason for backtracking (using latest released version of aiobotocore):
-
-```bash
-breeze ci-image build --upgrade-to-newer-dependencies --eager-upgrade-additional-requirements "aiobotocore==2.6.0"
-```
-
-Note. In this case the build succeeded, which means that this was simply a flaw in the `pip` resolution
-algorithm (which is based on some heuristics) and not a real problem with the dependencies. We will
-attempt to remove the limit in the next few days to see if the problem is resolved by other dependencies
-released in the meantime.
-
-9. Updated additional dependencies in `Dockerfile.ci` with appropriate comment:
-
-```
-# aiobotocore is limited temporarily until it stops backtracking pip
-ARG EAGER_UPGRADE_ADDITIONAL_REQUIREMENTS="aiobotocore<2.6.0"
-```
 
 # Manually refreshing the image cache
 
 ## Why we need to update image cache manually
 
 Sometimes, when we have a problem with our CI running and flakiness of GitHub Actions runners or our
-tests, the refresh might not be triggered. This has been mitigated by "Push Early Image Cache" job added in
-our CI, but there are other reasons you might want to refresh the cache. Sometimes we want to refresh the
+tests, the refresh might not be triggered. Sometimes we want to refresh the
 image cache in `vX_Y_test` branch (following our convention of branch names `vX_Y_test` branch is the branch
 used to release all `X.Y.*` versions of airflow) before we attempt to push a change there.
 There are no PRs happening in this branch, so manual refresh before we make a PR might speed up the PR build.
 Or sometimes we just refreshed the constraints (see below) and we want the cache to include those.
 
-## Prerequisites
+## How to refresh the image cache via the CI workflow (recommended)
+
+Run the [`Refresh image registry cache`](../.github/workflows/refresh-image-registry-cache.yml) workflow
+from the Actions tab, selecting the branch whose cache you want to refresh in GitHub's branch dropdown --
+the cache is namespaced per branch, so the branch you pick is the namespace written to. The `platform`
+input refreshes `linux/amd64`, `linux/arm64`, or both (the default).
+
+Prefer this over the local route below. The workflow needs no buildx / qemu setup on your machine, it
+does not depend on your upload bandwidth, it always covers every Python version, and it runs with the
+registry credentials the CI already has, so you do not need to be logged in to `ghcr.io` as a committer.
+
+A run you start by hand is not cancelled by merges landing while it works -- it uses a concurrency
+group of its own for that reason. Starting it again for the same branch does replace the run in
+flight. Push-triggered refreshes are never cancelled either; a newer one waits for the one in
+flight to finish.
+
+The workflow definition has to exist on the branch you select, so a release branch needs the workflow
+backported before it can be refreshed there.
+
+## Prerequisites for refreshing locally
+
+The rest of this chapter describes refreshing the cache from your own machine. It is a fallback for when
+the workflow cannot be used at all -- it is slower, and easy to get subtly wrong.
 
 Note that in order to refresh images you have to not only have `buildx` command installed for docker,
-but you should also make sure that you have the buildkit builder configured and set. Since we also build
-multi-platform images (for both AMD and ARM), you need to have support for qemu or hardware ARM/AMD builders
-configured. The chapters below explain both options.
+but you should also make sure that you have the buildkit builder configured and set.
+
+If you just refresh image cache for your platform (AMD or ARM) - buildx is all you need, but if
+you want to refresh the cache for both platforms, you need to have support for multi-platform builds
+you need to have support for qemu or hardware ARM/AMD builders configured. The chapters below explain both options.
 
 ### Setting up cache refreshing with emulation
 
@@ -339,7 +168,7 @@ docker buildx ls
        airflow_cache1    tcp://127.0.0.1:2375
 ```
 
-## How to refresh the image cache
+## How to refresh the image cache locally
 
 The images can be rebuilt and refreshed after the constraints are pushed. Refreshing image for all
 python version is as simple as running the [refresh_images.sh](refresh_images.sh) script which will
@@ -348,9 +177,26 @@ rebuild all the images in parallel and push them to the registry.
 Note that you need to run `docker login ghcr.io` before you run the script and you need to be
 a committer in order to be able to push the cache to the registry.
 
+By default the command refreshes both ARM and AMD images:
+
 ```bash
 ./dev/refresh_images.sh
 ```
+
+But you can also set PLATFORM variable if you want to refresh only single platform:
+
+```bash
+export PLATFORM=linux/amd64
+./dev/refresh_images.sh
+```
+
+or
+
+```bash
+export PLATFORM=linux/arm64
+./dev/refresh_images.sh
+```
+
 
 ## Is it safe to refresh the image cache?
 
@@ -390,6 +236,69 @@ with tests, but we KNOW that the tip of the branch is good and we want to releas
 we want to move the PRs of contributors to start using the new constraints. This should be done with caution
 and you need to be sure what you are doing, but you can always do it manually if you want.
 
+## How to refresh constraints via the CI workflow (recommended)
+
+The easiest way to refresh the constraints - for example to pick up newly released
+providers/dependencies from PyPI just before promoting an RC - is to run the
+[`Refresh constraints`](../.github/workflows/refresh-constraints.yml) workflow instead of
+running the `breeze` commands locally. It runs exactly the same steps that run automatically
+when `uv.lock` changes (it calls that workflow), builds the CI images, and commits/pushes to the
+matching `constraints-*` branch.
+
+It refreshes **all three constraint flavours**, not only the PyPI one:
+`constraints-source-providers-X.Y.txt` (providers from the sources, which is what CI and Breeze
+install), `constraints-no-providers-X.Y.txt` (core alone) and `constraints-X.Y.txt` (providers as
+published on PyPI, which is what users install). Refreshing only the PyPI flavour would leave CI
+and Breeze pinned to the older versions, so the three would disagree about the same dependency.
+
+The manual run is always launched from `main` and takes a `ref` input that selects the
+commit-ish (branch, tag or commit hash) whose sources the constraints are refreshed from. You
+do **not** select the release branch in GitHub's branch dropdown, and you do **not** need to
+cherry-pick anything to the `vX-Y-test` / `vX-Y-stable` branch first - the workflow definition
+and `breeze` come from `main`, while the sources come from the `ref` you pass. The only
+requirement is that the `breeze` constraint-generation commands work against that `ref` (they
+are stable across recent branches).
+
+Manual runs are restricted to release managers (the same allowlist as the prod image release
+workflow); the automatic `uv.lock`-push runs are not restricted.
+
+To run it:
+
+![Run the Refresh constraints workflow](images/update_constraints_run_workflow.png)
+
+1. Go to the [`Refresh constraints`](https://github.com/apache/airflow/actions/workflows/refresh-constraints.yml)
+   workflow in the Actions tab.
+2. Click **Run workflow** and keep the branch set to `main` (this is where the workflow runs
+   from - it is not the branch whose constraints get refreshed).
+3. In the **Repo reference to refresh constraints from** field, enter the ref to refresh
+   constraints from - for example `v3-3-test`, `v3-3-stable`, `constraints-3-3`, an RC tag, or a
+   commit hash. Leave it empty to refresh the branch you run from (`main` -> `constraints-main`).
+   The matching `constraints-X-Y` branch to push to is derived automatically from that ref's
+   `dev/breeze/src/airflow_breeze/branch_defaults.py`, so pointing at anything on the 3.3 line
+   refreshes `constraints-3-3`.
+4. Keep **Upgrade deps to newest from PyPI** enabled (the default) so the run picks up the
+   latest released providers/dependencies from PyPI. Disable it only if you want to regenerate
+   constraints strictly from that ref's `uv.lock` without upgrading.
+5. Once the run finishes, verify the new commit on the matching constraints branch
+   (for example `constraints-3-3` for a 3.3 refresh):
+
+   https://github.com/apache/airflow/commits/constraints-<major>-<minor>/
+
+   If the run instead fails with "moved ... while this run generated its constraints", something
+   else committed to that branch while it was working - typically the `Release constraints`
+   workflow pinning a release candidate. The run refuses to overwrite that commit with pins
+   resolved against the older baseline; run it again so it starts from the current branch.
+   Automatic `uv.lock`-push runs behave the same way.
+
+> [!NOTE]
+> Because `v3-3-test` and `v3-3-stable` can diverge while RCs are being voted on (fixes are
+> cherry-picked to `v3-3-test`), be deliberate about which `ref` you refresh from. Refresh from
+> the ref that matches the artifacts you are about to promote - typically `v3-3-stable` (or the
+> RC tag) for a release, not `v3-3-test`.
+
+If you cannot or do not want to use the workflow, you can still generate the constraints
+locally with the `breeze` commands below.
+
 ## How to generate constraint files
 
 ```bash
@@ -424,9 +333,10 @@ The slight risk is that if there is a constraint problem that impacts regular PR
 make all PRs "red" until the constraint is fixed. However, if this is the case then usually we should fix
 the problem by fixing the tests or dependencies and the automated CI process should be able to self-heal.
 The main build does not use constraints and it will attempt to upgrade (or downgrade) the dependencies to
-the latest version matching the dependency specification we have in setup.cfg/setup.py/provider.yaml files.
-Also the constraints are pushed without `--force` so there is no risk of destroying anything.
-The history is kept in Git, so you can always revert to the previous version if needed.
+the latest version matching the dependency specification we have in `pyproject.toml` files (note that provider
+dependencies in `pyproject.toml` are generated from provider.yaml files being the single source of truth for
+provider dependencies). Also, the constraints are pushed without `--force` so there is no risk of destroying
+anything. The history is kept in Git, so you can always revert to the previous version if needed.
 
 # Manually updating already tagged constraint files
 
@@ -455,13 +365,15 @@ This is a step-by-step instruction on how to use it:
 1. You need to have "airflow" repository checked out separately from the repository you are working on. For
    example in `/home/myuser/airflow-constraints` folder.
 2. You need to checkout `constraints-main` branch in this repository. By default the command expects that
-   there is a remote named "apache" pointing to the official Apache repository. You can override this
-    by passing `--remote-name` option to the command.
-3. You need to run `breeze release-management update-constraints` command. The `breeze` command comes usually
-   from another clone of airflow repository - usually from the `main` branch. You should pass those options to
+   there is a remote named "upstream" pointing to the `apache/airflow` repository (the standard remote
+   naming convention — see
+   [`contributing-docs/10_working_with_git.rst`](../contributing-docs/10_working_with_git.rst#git-remote-naming-conventions)).
+   You can override this by passing `--remote-name` option to the command.
+3. You need to run `breeze release-management update-constraints` command. Typically, `breeze` is run
+   from a separate clone of the Airflow repository, on the `main` branch. You should pass those options to
    the command:
       * path to the "constraints" repository
-      * remote name where the constraints should be pushed (optionally - default "apache")
+      * remote name where the constraints should be pushed (optionally - default "upstream")
       * list of airflow versions to update constraints for
       * list of constraints to update in the form of "package==version" (you can specify it multiple times)
       * message to be used in the commit message
@@ -473,7 +385,7 @@ This is a step-by-step instruction on how to use it:
 
 4. Verify manually if the change is visible as expected by inspecting the constraints at:
 
-https://github.com/apache/airflow/tree/constraints-<airfow-version>
+https://github.com/apache/airflow/tree/constraints-<airflow-version>
 
 ## Is it safe to update constraints manually?
 

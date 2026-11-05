@@ -17,7 +17,12 @@
 ---
 services:
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.70.0
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+      breeze.description: "Integration required for OTEL/opentelemetry hooks."
     container_name: "breeze-otel-collector"
     command: [--config=/etc/otel-collector-config.yml]
     volumes:
@@ -27,15 +32,26 @@ services:
       - "28889:8889"    # Prometheus exporter metrics
 
   prometheus:
-    image: prom/prometheus
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+    image: prom/prometheus:v3.5.4
     container_name: "breeze-prometheus"
     user: "0"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--enable-feature=native-histograms"
     ports:
       - "29090:9090"
     volumes:
       - ./prometheus-config.yml:/etc/prometheus/prometheus.yml
 
   grafana:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
     image: grafana/grafana:8.2.4
     container_name: "breeze-grafana"
     environment:
@@ -51,14 +67,42 @@ services:
       - ./grafana/volume/dashboards:/grafana/dashboards
       - ./grafana/volume/provisioning:/grafana/provisioning
 
+  jaeger:
+    labels:
+      org.apache.airflow.breeze: "true"
+      org.apache.airflow.breeze.worktree: "${BREEZE_WORKTREE_PATH:-}"
+      org.apache.airflow.breeze.host: "${BREEZE_HOST_ID:-}"
+    image: jaegertracing/all-in-one:1.57
+    container_name: "breeze-jaeger"
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+      COLLLECTOR_ZIPKIN_HOST_PORT: 9411
+    # Host ports are intentionally below 32768 to stay outside Linux's default
+    # ephemeral port range (32768-60999). Picking high ports inside that range
+    # causes intermittent CI failures when the kernel transiently grabs the
+    # same port for an outbound connection from another process on the runner.
+    ports:
+      - "26686:16686"
+      - "24317:4317"
+      - "27318:4318"
+      - "29422:9422"
+
   airflow:
     environment:
+      - INTEGRATION_OTEL=true
+      - OTEL_SERVICE_NAME=test
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_TRACES_EXPORTER=otlp_proto_http
+      - OTEL_METRICS_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://breeze-otel-collector:4318/v1/traces
+      - OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://breeze-otel-collector:4318/v1/metrics
+      - OTEL_METRIC_EXPORT_INTERVAL=30000
       - AIRFLOW__METRICS__OTEL_ON=True
-      - AIRFLOW__METRICS__OTEL_HOST=breeze-otel-collector
-      - AIRFLOW__METRICS__OTEL_PORT=4318
-      - AIRFLOW__METRICS__OTEL_INTERVAL_MILLISECONDS=30000
+      - AIRFLOW__TRACES__OTEL_ON=True
+      - AIRFLOW__TRACES__OTEL_TASK_LOG_EVENT=True  # todo: deprecate
 
     depends_on:
       - otel-collector
       - prometheus
       - grafana
+      - jaeger

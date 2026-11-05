@@ -14,10 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-ARG ALPINE_VERSION="3.14"
+ARG ALPINE_VERSION="3.23"
 FROM alpine:${ALPINE_VERSION} AS builder
 SHELL ["/bin/ash", "-e", "-x", "-c", "-o", "pipefail"]
 
+ARG PGBOUNCER_TAG
 ARG PGBOUNCER_VERSION
 ARG AIRFLOW_PGBOUNCER_VERSION
 
@@ -26,16 +27,19 @@ ARG PGBOUNCER_SHA256
 # Those are build deps only but still we want the latest versions of those
 # "Pin versions in apk add" https://github.com/hadolint/hadolint/wiki/DL3018
 # hadolint ignore=DL3018
-RUN apk --no-cache add make pkgconfig build-base libtool wget gcc g++ libevent-dev libressl-dev c-ares-dev ca-certificates
+RUN apk --no-cache add make pkgconfig build-base libtool wget gcc g++ libevent-dev openssl-dev c-ares-dev ca-certificates
 # We are not using Dash so we can safely ignore the "Dash warning"
 # "In dash, something is not supported." https://github.com/koalaman/shellcheck/wiki/SC2169
 # hadolint ignore=SC2169,SC3060
-RUN wget --progress=dot:giga "https://github.com/pgbouncer/pgbouncer/releases/download/pgbouncer_${PGBOUNCER_VERSION//\./_}/pgbouncer-${PGBOUNCER_VERSION}.tar.gz" \
+RUN wget --progress=dot:giga "https://github.com/pgbouncer/pgbouncer/releases/download/${PGBOUNCER_TAG}/pgbouncer-${PGBOUNCER_VERSION}.tar.gz" \
     && echo "${PGBOUNCER_SHA256}  pgbouncer-${PGBOUNCER_VERSION}.tar.gz" | sha256sum -c - \
     && tar -xzvf pgbouncer-$PGBOUNCER_VERSION.tar.gz
 
 WORKDIR /pgbouncer-$PGBOUNCER_VERSION
-RUN ./configure --prefix=/usr --disable-debug && make && make install \
+# Release tarballs no longer ship prebuilt man pages, and `make install` would need pandoc to
+# generate them. Only the binary is copied to the final image, so build and install just that.
+RUN ./configure --prefix=/usr --disable-debug && make pgbouncer \
+    && install -m 755 pgbouncer /usr/bin/pgbouncer \
     && mkdir /etc/pgbouncer \
     && cp ./etc/pgbouncer.ini /etc/pgbouncer/ \
     && touch /etc/pgbouncer/userlist.txt \
@@ -55,7 +59,8 @@ ARG COMMIT_SHA
 # We want to make sure this one includes latest security fixes.
 # "Pin versions in apk add" https://github.com/hadolint/hadolint/wiki/DL3018
 # hadolint ignore=DL3018
-RUN apk --no-cache add libevent libressl c-ares
+RUN apk --no-cache upgrade \
+    && apk --no-cache add libevent libssl3 libcrypto3 c-ares
 
 COPY --from=builder /etc/pgbouncer /etc/pgbouncer
 COPY --from=builder /usr/bin/pgbouncer /usr/bin/pgbouncer
